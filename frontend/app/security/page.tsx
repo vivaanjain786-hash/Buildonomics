@@ -1,3 +1,5 @@
-﻿import { ArrowLeft, ShieldCheck, CheckCircle2 } from "lucide-react";
-import Link from "next/link";
-export default function SecurityPage() { return <main className="simple-product-page"><Link className="simple-back" href="/"><ArrowLeft size={14}/> Command Center</Link><div className="routex-eyebrow">Risk surface</div><h1>Security <span>assumptions.</span></h1><p className="simple-copy">Make provider and settlement assumptions visible before execution.</p><section className="simple-panel simple-list"><div><ShieldCheck/><span>Canonical bridge</span><small>Trust model recorded for each candidate route</small></div><div><CheckCircle2/><span>Provider-neutral evaluation</span><small>No single bridge is hard-coded as the universal choice</small></div></section></main>; }
+import OperationsPage from "@/components/OperationsPage";
+
+export default function Page() {
+  return <OperationsPage mode="security" />;
+}

@@ -25,8 +25,12 @@ import type {
 } from "@/lib/types";
 
 /*
- * These are frontend UI options, not route/backend data.
- * The selected value is sent to the backend as part of the intent.
+ * These are UI controls only.
+ *
+ * They are NOT blockchain data, route data, provider data,
+ * pricing data, or recommendation data.
+ *
+ * The selected preference is sent to the backend.
  */
 const policies: {
   label: string;
@@ -51,12 +55,13 @@ const policies: {
 ];
 
 function money(value: number) {
-  return (
-    "$" +
-    value.toLocaleString(undefined, {
-      maximumFractionDigits: 2,
-    })
-  );
+  if (!Number.isFinite(value)) {
+    return "—";
+  }
+
+  return `$${value.toLocaleString(undefined, {
+    maximumFractionDigits: 2,
+  })}`;
 }
 
 function duration(seconds: number) {
@@ -75,6 +80,35 @@ function duration(seconds: number) {
   return `${minutes}m ${String(remainingSeconds).padStart(2, "0")}s`;
 }
 
+/*
+ * Supports both common backend representations:
+ *
+ * 0.991  -> 99.1%
+ * 99.1   -> 99.1%
+ *
+ * This does not create data. It only formats the value returned
+ * by the backend.
+ */
+function reliability(value: number) {
+  if (!Number.isFinite(value)) {
+    return "—";
+  }
+
+  const percentage = value >= 0 && value <= 1 ? value * 100 : value;
+
+  return `${percentage.toFixed(1)}%`;
+}
+
+function percentage(value: number) {
+  if (!Number.isFinite(value)) {
+    return "—";
+  }
+
+  const normalized = value >= 0 && value <= 1 ? value * 100 : value;
+
+  return `${normalized.toFixed(2)}%`;
+}
+
 function formatPreference(preference: Preference) {
   switch (preference) {
     case "lowest_cost":
@@ -88,12 +122,15 @@ function formatPreference(preference: Preference) {
 
     case "balanced":
       return "Balanced";
+
+    default:
+      return preference;
   }
 }
 
 function getSecurityText(route: Route) {
   if (
-    route.security_assumptions &&
+    Array.isArray(route.security_assumptions) &&
     route.security_assumptions.length > 0
   ) {
     return route.security_assumptions.join(" · ");
@@ -107,20 +144,22 @@ function IntelligenceContent() {
   const params = useSearchParams();
 
   /*
-   * All execution intent values come from the URL.
+   * The execution intent comes from the previous page.
    *
-   * The URL itself is populated by the previous frontend screen.
-   * No blockchain/route values are invented here.
+   * Nothing related to a blockchain, route, provider, amount,
+   * price, latency, liquidity, reliability, etc. is created here.
    */
   const source = params.get("source");
   const destination = params.get("destination");
   const asset = params.get("asset");
   const amount = params.get("amount");
-  const urlPreference = params.get("preference") as Preference | null;
+  const urlPreference = params.get("preference");
 
-  const validPreference =
-    urlPreference &&
-    policies.some((policy) => policy.value === urlPreference)
+  const validPreference: Preference | null =
+    urlPreference === "lowest_cost" ||
+    urlPreference === "fastest" ||
+    urlPreference === "balanced" ||
+    urlPreference === "reliability"
       ? urlPreference
       : null;
 
@@ -130,35 +169,37 @@ function IntelligenceContent() {
   const [data, setData] =
     useState<RouteEvaluationResponse | null>(null);
 
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] =
+    useState<string | null>(null);
 
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+
+  const [error, setError] =
+    useState<string | null>(null);
 
   /*
-   * Keep the preference synchronized with the URL.
-   *
-   * The URL is the source of the execution intent.
+   * Keep the local preference synchronized with the URL.
    */
   useEffect(() => {
     setPreference(validPreference);
   }, [validPreference]);
 
   /*
-   * Request route intelligence from the backend.
+   * Ask the backend for route intelligence.
    *
-   * IMPORTANT:
-   * No route information is created on the frontend.
+   * The frontend sends ONLY the execution intent.
    *
-   * The frontend only sends the execution intent:
-   * source chain
-   * destination chain
-   * asset
-   * amount
-   * preference
+   * The backend is responsible for:
    *
-   * The backend is responsible for generating and evaluating
-   * candidate routes.
+   * - discovering routes
+   * - calculating cost
+   * - calculating latency
+   * - calculating liquidity
+   * - calculating slippage
+   * - calculating reliability
+   * - calculating Pareto optimality
+   * - selecting the recommended route
+   * - generating the explanation
    */
   useEffect(() => {
     if (
@@ -171,30 +212,21 @@ function IntelligenceContent() {
       setData(null);
       setSelectedId(null);
       setError(null);
+      setLoading(false);
       return;
     }
 
-    /*
-     * Capture the values after the null check.
-     *
-     * This is important because TypeScript does not preserve
-     * the narrowing of values inside the nested async function.
-     *
-     * These constants contain only values supplied by the URL.
-     * Nothing is hardcoded here.
-     */
     const sourceChain = source;
     const destinationChain = destination;
     const assetName = asset;
-    const amountValue = amount;
+    const amountValue = Number(amount);
     const preferenceValue = preference;
 
-    const numericAmount = Number(amountValue);
-
-    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+    if (!Number.isFinite(amountValue) || amountValue <= 0) {
       setData(null);
       setSelectedId(null);
       setError("Invalid execution amount.");
+      setLoading(false);
       return;
     }
 
@@ -205,18 +237,11 @@ function IntelligenceContent() {
         setLoading(true);
         setError(null);
 
-        /*
-         * Backend integration point.
-         *
-         * No route data is hardcoded here.
-         * The backend must return the complete
-         * RouteEvaluationResponse.
-         */
         const result = await evaluateRoutes({
           source_chain: sourceChain,
           destination_chain: destinationChain,
           asset: assetName,
-          amount: numericAmount,
+          amount: amountValue,
           preference: preferenceValue,
         });
 
@@ -227,12 +252,32 @@ function IntelligenceContent() {
         setData(result);
 
         /*
-         * Prefer the backend's explicit recommendation.
+         * Recommendation comes from the backend.
          *
-         * If the backend does not provide one, select nothing
-         * instead of inventing a recommendation.
+         * First preference:
+         * recommended_route_id
+         *
+         * Fallback:
+         * route.recommended
+         *
+         * If neither exists, nothing is selected.
          */
-        setSelectedId(result.recommended_route_id ?? null);
+        const backendRecommended =
+          result.recommended_route_id;
+
+        const recommendedRoute =
+          backendRecommended
+            ? result.routes.find(
+                (route) =>
+                  route.id === backendRecommended
+              )
+            : result.routes.find(
+                (route) => route.recommended
+              );
+
+        setSelectedId(
+          recommendedRoute?.id ?? null
+        );
       } catch (err) {
         if (cancelled) {
           return;
@@ -267,18 +312,18 @@ function IntelligenceContent() {
   ]);
 
   /*
-   * Every route shown on this page comes from the backend.
+   * EVERYTHING below this point is derived from backend data.
    */
   const routes = data?.routes ?? [];
 
   const selected =
-    routes.find((route) => route.id === selectedId) ?? null;
+    routes.find(
+      (route) => route.id === selectedId
+    ) ?? null;
 
   /*
-   * Build the graph entirely from backend route paths.
-   *
-   * Nothing about Ethereum, Base, Arbitrum, Optimism, etc.
-   * is assumed here.
+   * Create graph nodes from route paths returned
+   * by the backend.
    */
   const graphNodes = useMemo(() => {
     const nodes: string[] = [];
@@ -295,10 +340,7 @@ function IntelligenceContent() {
   }, [routes]);
 
   /*
-   * Convert backend paths into graph edges.
-   *
-   * Multiple routes may use the same chain-to-chain connection,
-   * so we deduplicate them.
+   * Create graph connections from backend route paths.
    */
   const graphEdges = useMemo(() => {
     const edgeMap = new Map<
@@ -311,9 +353,22 @@ function IntelligenceContent() {
     >();
 
     for (const route of routes) {
-      for (let i = 0; i < route.path.length - 1; i++) {
+      if (!Array.isArray(route.path)) {
+        continue;
+      }
+
+      for (
+        let i = 0;
+        i < route.path.length - 1;
+        i++
+      ) {
         const from = route.path[i];
         const to = route.path[i + 1];
+
+        if (!from || !to) {
+          continue;
+        }
+
         const key = `${from}::${to}`;
 
         const existing = edgeMap.get(key);
@@ -335,25 +390,35 @@ function IntelligenceContent() {
     return Array.from(edgeMap.values());
   }, [routes]);
 
-  /*
-   * Derived entirely from backend route data.
-   */
   const paretoCount = routes.filter(
     (route) => route.pareto_optimal
   ).length;
 
-  const handlePolicyChange = (nextPreference: Preference) => {
-    setPreference(nextPreference);
+  /*
+   * graphNodes is intentionally calculated above even though
+   * the current visual graph uses edges directly.
+   *
+   * This gives us a clean backend-driven graph model for
+   * future D3 / interactive graph implementation.
+   */
+  void graphNodes;
 
-    const nextParams = new URLSearchParams(
-      params.toString()
+  const handlePolicyChange = (
+    nextPreference: Preference
+  ) => {
+    const nextParams =
+      new URLSearchParams(params.toString());
+
+    nextParams.set(
+      "preference",
+      nextPreference
     );
-
-    nextParams.set("preference", nextPreference);
 
     router.replace(
       `/intelligence?${nextParams.toString()}`,
-      { scroll: false }
+      {
+        scroll: false,
+      }
     );
   };
 
@@ -362,46 +427,71 @@ function IntelligenceContent() {
       return;
     }
 
-    const nextParams = new URLSearchParams();
+    const nextParams =
+      new URLSearchParams();
 
     /*
-     * Route ID comes directly from backend response.
+     * Route ID comes directly from backend data.
      */
-    nextParams.set("route", selected.id);
+    nextParams.set(
+      "route",
+      selected.id
+    );
 
     /*
-     * Request ID comes directly from backend response.
+     * Request ID comes directly from backend data.
      */
-    nextParams.set("request_id", data.request_id);
+    nextParams.set(
+      "request_id",
+      data.request_id
+    );
 
     /*
-     * Preserve the original execution intent.
+     * Preserve the execution intent supplied by
+     * the previous page.
      */
     if (source) {
-      nextParams.set("source", source);
-    }
+  nextParams.set(
+    "source_chain",
+    source
+  );
+}
 
-    if (destination) {
-      nextParams.set("destination", destination);
-    }
+if (destination) {
+  nextParams.set(
+    "destination_chain",
+    destination
+  );
+}
 
     if (asset) {
-      nextParams.set("asset", asset);
+      nextParams.set(
+        "asset",
+        asset
+      );
     }
 
     if (amount) {
-      nextParams.set("amount", amount);
+      nextParams.set(
+        "amount",
+        amount
+      );
     }
 
     if (preference) {
-      nextParams.set("preference", preference);
+      nextParams.set(
+        "preference",
+        preference
+      );
     }
 
-    router.push(`/execute?${nextParams.toString()}`);
+    router.push(
+      `/execute?${nextParams.toString()}`
+    );
   };
 
   /*
-   * Missing intent state.
+   * No execution intent was supplied.
    */
   if (
     !source ||
@@ -415,7 +505,9 @@ function IntelligenceContent() {
         <header className="intel-topbar">
           <button
             className="intel-back"
-            onClick={() => router.push("/")}
+            onClick={() =>
+              router.push("/")
+            }
           >
             <ArrowLeft size={15} />
             Command Center
@@ -424,7 +516,9 @@ function IntelligenceContent() {
           <div className="intel-breadcrumb">
             <span>RouteX</span>
             <ChevronRight size={12} />
-            <strong>Route Intelligence</strong>
+            <strong>
+              Route Intelligence
+            </strong>
           </div>
 
           <div className="intel-live">
@@ -441,12 +535,16 @@ function IntelligenceContent() {
               </div>
 
               <h1 className="intel-title">
-                Route <span>intelligence.</span>
+                Route{" "}
+                <span>
+                  intelligence.
+                </span>
               </h1>
 
               <p className="intel-copy">
-                Submit a complete execution intent to discover and
-                evaluate available routes.
+                Submit a complete execution
+                intent to discover and evaluate
+                available routes.
               </p>
             </div>
           </div>
@@ -461,14 +559,17 @@ function IntelligenceContent() {
             </h2>
 
             <p className="simple-copy">
-              Source chain, destination chain, asset, amount and
-              preference are required before route evaluation can
-              begin.
+              Source chain, destination chain,
+              asset, amount and preference are
+              required before route evaluation
+              can begin.
             </p>
 
             <button
               className="intel-execute"
-              onClick={() => router.push("/")}
+              onClick={() =>
+                router.push("/")
+              }
             >
               Return to Command Center
               <ArrowRight size={14} />
@@ -484,7 +585,9 @@ function IntelligenceContent() {
       <header className="intel-topbar">
         <button
           className="intel-back"
-          onClick={() => router.push("/")}
+          onClick={() =>
+            router.push("/")
+          }
         >
           <ArrowLeft size={15} />
           Command Center
@@ -493,7 +596,9 @@ function IntelligenceContent() {
         <div className="intel-breadcrumb">
           <span>RouteX</span>
           <ChevronRight size={12} />
-          <strong>Route Intelligence</strong>
+          <strong>
+            Route Intelligence
+          </strong>
         </div>
 
         <div className="intel-live">
@@ -515,29 +620,42 @@ function IntelligenceContent() {
             </div>
 
             <h1 className="intel-title">
-              Route <span>intelligence.</span>
+              Route{" "}
+              <span>
+                intelligence.
+              </span>
             </h1>
 
             <p className="intel-copy">
-              Evaluate viable execution paths for{" "}
+              Evaluate viable execution paths
+              for{" "}
               <strong>
                 {amount} {asset}
               </strong>{" "}
               from{" "}
-              <strong>{source}</strong> to{" "}
-              <strong>{destination}</strong>{" "}
-              across cost, latency, liquidity, slippage,
-              reliability and security assumptions.
+              <strong>
+                {source}
+              </strong>{" "}
+              to{" "}
+              <strong>
+                {destination}
+              </strong>{" "}
+              across cost, latency, liquidity,
+              slippage, reliability and security
+              assumptions.
             </p>
           </div>
 
-          {!loading && !error && data && (
-            <div className="intel-route-pill">
-              <Network size={14} />
-              {routes.length} candidates · {paretoCount}{" "}
-              Pareto-optimal
-            </div>
-          )}
+          {!loading &&
+            !error &&
+            data && (
+              <div className="intel-route-pill">
+                <Network size={14} />
+
+                {routes.length} candidates ·{" "}
+                {paretoCount} Pareto-optimal
+              </div>
+            )}
         </div>
 
         {loading && (
@@ -551,8 +669,9 @@ function IntelligenceContent() {
             </h2>
 
             <p className="simple-copy">
-              The execution intelligence backend is evaluating
-              available routes for this intent.
+              The execution intelligence backend
+              is evaluating available routes for
+              this intent.
             </p>
           </section>
         )}
@@ -573,7 +692,9 @@ function IntelligenceContent() {
 
             <button
               className="intel-execute"
-              onClick={() => window.location.reload()}
+              onClick={() =>
+                window.location.reload()
+              }
             >
               Retry evaluation
               <ArrowRight size={14} />
@@ -595,8 +716,9 @@ function IntelligenceContent() {
               </h2>
 
               <p className="simple-copy">
-                The backend did not return an executable route for
-                this execution intent.
+                The backend did not return an
+                executable route for this
+                execution intent.
               </p>
             </section>
           )}
@@ -634,73 +756,97 @@ function IntelligenceContent() {
                     }}
                   >
                     {graphEdges.length > 0 ? (
-                      graphEdges.map((edge) => (
-                        <div
-                          key={`${edge.from}-${edge.to}`}
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "12px",
-                            flexWrap: "wrap",
-                          }}
-                        >
-                          <div className="intel-node">
-                            <strong>{edge.from}</strong>
-                            <small>CHAIN</small>
-                          </div>
-
+                      graphEdges.map(
+                        (edge) => (
                           <div
+                            key={`${edge.from}-${edge.to}`}
                             style={{
-                              flex: "1 1 80px",
-                              minWidth: "80px",
-                              height: "1px",
-                              background:
-                                "rgba(143, 134, 238, 0.45)",
-                            }}
-                          />
-
-                          <div
-                            className="intel-edge"
-                            style={{
-                              position: "static",
-                              transform: "none",
+                              display: "flex",
+                              alignItems:
+                                "center",
+                              gap: "12px",
+                              flexWrap:
+                                "wrap",
                             }}
                           >
-                            <span>
-                              {edge.routeIds.join(" · ")}
-                            </span>
-                          </div>
+                            <div className="intel-node">
+                              <strong>
+                                {edge.from}
+                              </strong>
 
-                          <div
-                            style={{
-                              flex: "1 1 80px",
-                              minWidth: "80px",
-                              height: "1px",
-                              background:
-                                "rgba(143, 134, 238, 0.45)",
-                            }}
-                          />
+                              <small>
+                                CHAIN
+                              </small>
+                            </div>
 
-                          <div className="intel-node">
-                            <strong>{edge.to}</strong>
-                            <small>CHAIN</small>
+                            <div
+                              style={{
+                                flex:
+                                  "1 1 80px",
+                                minWidth:
+                                  "80px",
+                                height: "1px",
+                                background:
+                                  "rgba(143, 134, 238, 0.45)",
+                              }}
+                            />
+
+                            <div
+                              className="intel-edge"
+                              style={{
+                                position:
+                                  "static",
+                                transform:
+                                  "none",
+                              }}
+                            >
+                              <span>
+                                {edge.routeIds.join(
+                                  " · "
+                                )}
+                              </span>
+                            </div>
+
+                            <div
+                              style={{
+                                flex:
+                                  "1 1 80px",
+                                minWidth:
+                                  "80px",
+                                height: "1px",
+                                background:
+                                  "rgba(143, 134, 238, 0.45)",
+                              }}
+                            />
+
+                            <div className="intel-node">
+                              <strong>
+                                {edge.to}
+                              </strong>
+
+                              <small>
+                                CHAIN
+                              </small>
+                            </div>
                           </div>
-                        </div>
-                      ))
+                        )
+                      )
                     ) : (
                       <div className="simple-copy">
-                        No graph connections were returned by
-                        the backend.
+                        No graph connections were
+                        returned by the backend.
                       </div>
                     )}
                   </div>
 
                   <div className="intel-graph-note">
                     <Info size={13} />
-                    Nodes represent chains. Edges represent
-                    bridge, solver or settlement mechanisms
-                    returned by the execution intelligence
-                    backend.
+
+                    Nodes represent chains.
+                    Connections represent the
+                    mechanisms represented by
+                    routes returned by the execution
+                    intelligence backend.
                   </div>
                 </section>
 
@@ -711,7 +857,9 @@ function IntelligenceContent() {
                         Policy layer
                       </div>
 
-                      <h2>Recommendation</h2>
+                      <h2>
+                        Recommendation
+                      </h2>
                     </div>
 
                     <Sparkles size={18} />
@@ -720,7 +868,8 @@ function IntelligenceContent() {
                   {data.recommended_route_id &&
                   routes.find(
                     (route) =>
-                      route.id === data.recommended_route_id
+                      route.id ===
+                      data.recommended_route_id
                   ) ? (
                     (() => {
                       const recommendation =
@@ -728,14 +877,20 @@ function IntelligenceContent() {
                           (route) =>
                             route.id ===
                             data.recommended_route_id
-                        )!;
+                        );
+
+                      if (!recommendation) {
+                        return null;
+                      }
 
                       return (
                         <>
                           <div className="intel-rec-main">
                             <div className="intel-rec-title">
                               <strong>
-                                {recommendation.id}
+                                {
+                                  recommendation.id
+                                }
                               </strong>
 
                               <span>
@@ -748,13 +903,18 @@ function IntelligenceContent() {
                               {recommendation.path.join(
                                 " → "
                               )}{" "}
-                              · {recommendation.provider}
+                              ·{" "}
+                              {
+                                recommendation.provider
+                              }
                             </div>
                           </div>
 
                           <div className="intel-metrics">
                             <div>
-                              <small>COST</small>
+                              <small>
+                                COST
+                              </small>
 
                               <strong>
                                 {money(
@@ -764,7 +924,9 @@ function IntelligenceContent() {
                             </div>
 
                             <div>
-                              <small>LATENCY</small>
+                              <small>
+                                LATENCY
+                              </small>
 
                               <strong>
                                 {duration(
@@ -774,10 +936,14 @@ function IntelligenceContent() {
                             </div>
 
                             <div>
-                              <small>RELIABILITY</small>
+                              <small>
+                                RELIABILITY
+                              </small>
 
                               <strong>
-                                {recommendation.reliability}%
+                                {reliability(
+                                  recommendation.reliability
+                                )}
                               </strong>
                             </div>
                           </div>
@@ -806,8 +972,8 @@ function IntelligenceContent() {
                     })()
                   ) : (
                     <div className="simple-copy">
-                      The backend did not provide a recommended
-                      route.
+                      The backend did not provide a
+                      recommended route.
                     </div>
                   )}
                 </section>
@@ -826,23 +992,28 @@ function IntelligenceContent() {
                   </div>
 
                   <div className="intel-policies">
-                    {policies.map((policy) => (
-                      <button
-                        key={policy.value}
-                        className={
-                          preference === policy.value
-                            ? "active"
-                            : ""
-                        }
-                        onClick={() =>
-                          handlePolicyChange(
+                    {policies.map(
+                      (policy) => (
+                        <button
+                          key={
                             policy.value
-                          )
-                        }
-                      >
-                        {policy.label}
-                      </button>
-                    ))}
+                          }
+                          className={
+                            preference ===
+                            policy.value
+                              ? "active"
+                              : ""
+                          }
+                          onClick={() =>
+                            handlePolicyChange(
+                              policy.value
+                            )
+                          }
+                        >
+                          {policy.label}
+                        </button>
+                      )
+                    )}
                   </div>
                 </div>
 
@@ -857,62 +1028,83 @@ function IntelligenceContent() {
                     <span>STATUS</span>
                   </div>
 
-                  {routes.map((route) => (
-                    <button
-                      key={route.id}
-                      className={`intel-row intel-data ${
-                        selected?.id === route.id
-                          ? "selected"
-                          : ""
-                      }`}
-                      onClick={() =>
-                        setSelectedId(route.id)
-                      }
-                    >
-                      <span>
-                        <strong>{route.id}</strong>
-
-                        <small>
-                          {route.path.join(" → ")} ·{" "}
-                          {route.provider}
-                        </small>
-                      </span>
-
-                      <span>
-                        {money(route.cost)}
-                      </span>
-
-                      <span>
-                        {duration(
-                          route.latency_seconds
-                        )}
-                      </span>
-
-                      <span>
-                        {money(route.liquidity)}
-                      </span>
-
-                      <span>
-                        {route.slippage.toFixed(2)}%
-                      </span>
-
-                      <span>
-                        {route.reliability}%
-                      </span>
-
-                      <span
-                        className={
-                          route.pareto_optimal
-                            ? "pareto"
-                            : "normal"
+                  {routes.map(
+                    (route) => (
+                      <button
+                        key={route.id}
+                        className={`intel-row intel-data ${
+                          selected?.id ===
+                          route.id
+                            ? "selected"
+                            : ""
+                        }`}
+                        onClick={() =>
+                          setSelectedId(
+                            route.id
+                          )
                         }
                       >
-                        {route.pareto_optimal
-                          ? "PARETO"
-                          : route.status || "Candidate"}
-                      </span>
-                    </button>
-                  ))}
+                        <span>
+                          <strong>
+                            {route.id}
+                          </strong>
+
+                          <small>
+                            {route.path.join(
+                              " → "
+                            )}{" "}
+                            ·{" "}
+                            {
+                              route.provider
+                            }
+                          </small>
+                        </span>
+
+                        <span>
+                          {money(
+                            route.cost
+                          )}
+                        </span>
+
+                        <span>
+                          {duration(
+                            route.latency_seconds
+                          )}
+                        </span>
+
+                        <span>
+                          {money(
+                            route.liquidity
+                          )}
+                        </span>
+
+                        <span>
+                          {percentage(
+                            route.slippage
+                          )}
+                        </span>
+
+                        <span>
+                          {reliability(
+                            route.reliability
+                          )}
+                        </span>
+
+                        <span
+                          className={
+                            route.pareto_optimal
+                              ? "pareto"
+                              : "normal"
+                          }
+                        >
+                          {route.pareto_optimal
+                            ? "PARETO"
+                            : route.status ||
+                              "Candidate"}
+                        </span>
+                      </button>
+                    )
+                  )}
                 </div>
               </section>
 
@@ -930,14 +1122,20 @@ function IntelligenceContent() {
 
                     <div className="intel-path-large">
                       {selected.path.map(
-                        (node, index) => (
+                        (
+                          node,
+                          index
+                        ) => (
                           <span
                             key={`${node}-${index}`}
                           >
-                            <b>{node}</b>
+                            <b>
+                              {node}
+                            </b>
 
                             {index <
-                              selected.path.length -
+                              selected.path
+                                .length -
                                 1 && (
                               <ArrowRight
                                 size={14}
@@ -957,7 +1155,9 @@ function IntelligenceContent() {
                         </small>
 
                         <strong>
-                          {money(selected.cost)}
+                          {money(
+                            selected.cost
+                          )}
                         </strong>
                       </div>
 
@@ -983,10 +1183,9 @@ function IntelligenceContent() {
                         </small>
 
                         <strong>
-                          {selected.slippage.toFixed(
-                            2
+                          {percentage(
+                            selected.slippage
                           )}
-                          %
                         </strong>
                       </div>
 
@@ -1021,17 +1220,24 @@ function IntelligenceContent() {
                       </p>
                     ) : (
                       <p className="simple-copy">
-                        The backend did not provide an
-                        explanation for this route.
+                        The backend did not
+                        provide an explanation
+                        for this route.
                       </p>
                     )}
 
-                    {selected.security_assumptions &&
+                    {Array.isArray(
                       selected.security_assumptions
+                    ) &&
+                      selected
+                        .security_assumptions
                         .length > 0 && (
                         <ul>
                           {selected.security_assumptions.map(
-                            (assumption, index) => (
+                            (
+                              assumption,
+                              index
+                            ) => (
                               <li
                                 key={`${assumption}-${index}`}
                               >
@@ -1073,11 +1279,14 @@ export default function IntelligencePage() {
 
           <h1>
             Loading{" "}
-            <span>route intelligence.</span>
+            <span>
+              route intelligence.
+            </span>
           </h1>
 
           <p className="simple-copy">
-            Preparing the execution intelligence layer...
+            Preparing the execution intelligence
+            layer...
           </p>
         </main>
       }
