@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import { Suspense, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
   ArrowRight,
@@ -17,151 +17,467 @@ import {
 } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 
-type Route = {
-  id: string;
-  provider: string;
-  path: string[];
-  cost: number;
-  latency: number;
-  liquidity: number;
-  slippage: number;
-  reliability: number;
-  hops: number;
-  security: string;
-  pareto: boolean;
-};
+import { evaluateRoutes } from "@/lib/api";
+import type {
+  Preference,
+  Route,
+  RouteEvaluationResponse,
+} from "@/lib/types";
 
-const routes: Route[] = [
+/*
+ * These are frontend UI options, not route/backend data.
+ * The selected value is sent to the backend as part of the intent.
+ */
+const policies: {
+  label: string;
+  value: Preference;
+}[] = [
   {
-    id: "RX-01",
-    provider: "Canonical",
-    path: ["Ethereum", "Base"],
-    cost: 4.21,
-    latency: 124,
-    liquidity: 2400000,
-    slippage: 0.08,
-    reliability: 99.1,
-    hops: 1,
-    security: "Canonical bridge",
-    pareto: true,
+    label: "Lowest cost",
+    value: "lowest_cost",
   },
   {
-    id: "RX-02",
-    provider: "Across",
-    path: ["Ethereum", "Base"],
-    cost: 3.76,
-    latency: 68,
-    liquidity: 1850000,
-    slippage: 0.11,
-    reliability: 98.7,
-    hops: 1,
-    security: "Intent solver",
-    pareto: true,
+    label: "Fastest",
+    value: "fastest",
   },
   {
-    id: "RX-03",
-    provider: "Arbitrum route",
-    path: ["Ethereum", "Arbitrum", "Base"],
-    cost: 2.94,
-    latency: 210,
-    liquidity: 3200000,
-    slippage: 0.06,
-    reliability: 99.4,
-    hops: 2,
-    security: "2-step bridge",
-    pareto: true,
+    label: "Balanced",
+    value: "balanced",
   },
   {
-    id: "RX-04",
-    provider: "Optimism route",
-    path: ["Ethereum", "Optimism", "Base"],
-    cost: 3.12,
-    latency: 176,
-    liquidity: 2700000,
-    slippage: 0.07,
-    reliability: 98.9,
-    hops: 2,
-    security: "2-step bridge",
-    pareto: false,
-  },
-  {
-    id: "RX-05",
-    provider: "Fast solver",
-    path: ["Ethereum", "Base"],
-    cost: 5.08,
-    latency: 43,
-    liquidity: 1200000,
-    slippage: 0.15,
-    reliability: 97.8,
-    hops: 1,
-    security: "Solver settlement",
-    pareto: false,
+    label: "Reliability",
+    value: "reliability",
   },
 ];
 
-const policies = [
-  "Lowest cost",
-  "Fastest",
-  "Balanced",
-  "Reliability",
-] as const;
-
-type Policy = (typeof policies)[number];
-
-function choose(routes: Route[], policy: Policy) {
-  const score = (r: Route) => {
-    if (policy === "Lowest cost") return r.cost;
-    if (policy === "Fastest") return r.latency;
-    if (policy === "Reliability") return -r.reliability;
-
-    return (
-      r.cost / 4.2 +
-      r.latency / 120 -
-      (r.reliability / 100) * 1.5 +
-      r.hops * 0.25
-    );
-  };
-
-  return [...routes].sort((a, b) => score(a) - score(b))[0];
-}
-
-function money(n: number) {
+function money(value: number) {
   return (
     "$" +
-    n.toLocaleString(undefined, {
+    value.toLocaleString(undefined, {
       maximumFractionDigits: 2,
     })
   );
 }
 
 function duration(seconds: number) {
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
+  if (!Number.isFinite(seconds)) {
+    return "—";
+  }
 
-  return m
-    ? `${m}m ${String(s).padStart(2, "0")}s`
-    : `${s}s`;
+  const totalSeconds = Math.max(0, Math.round(seconds));
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainingSeconds = totalSeconds % 60;
+
+  if (minutes === 0) {
+    return `${remainingSeconds}s`;
+  }
+
+  return `${minutes}m ${String(remainingSeconds).padStart(2, "0")}s`;
+}
+
+function formatPreference(preference: Preference) {
+  switch (preference) {
+    case "lowest_cost":
+      return "Lowest cost";
+
+    case "fastest":
+      return "Fastest";
+
+    case "reliability":
+      return "Reliability";
+
+    case "balanced":
+      return "Balanced";
+  }
+}
+
+function getSecurityText(route: Route) {
+  if (
+    route.security_assumptions &&
+    route.security_assumptions.length > 0
+  ) {
+    return route.security_assumptions.join(" · ");
+  }
+
+  return "Not provided";
 }
 
 function IntelligenceContent() {
   const router = useRouter();
   const params = useSearchParams();
 
-  const [policy, setPolicy] = useState<Policy>("Balanced");
-  const [selectedId, setSelectedId] = useState("RX-01");
+  /*
+   * All execution intent values come from the URL.
+   *
+   * The URL itself is populated by the previous frontend screen.
+   * No blockchain/route values are invented here.
+   */
+  const source = params.get("source");
+  const destination = params.get("destination");
+  const asset = params.get("asset");
+  const amount = params.get("amount");
+  const urlPreference = params.get("preference") as Preference | null;
 
-  const recommendation = useMemo(
-    () => choose(routes, policy),
-    [policy]
-  );
+  const validPreference =
+    urlPreference &&
+    policies.some((policy) => policy.value === urlPreference)
+      ? urlPreference
+      : null;
+
+  const [preference, setPreference] =
+    useState<Preference | null>(validPreference);
+
+  const [data, setData] =
+    useState<RouteEvaluationResponse | null>(null);
+
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  /*
+   * Keep the preference synchronized with the URL.
+   *
+   * The URL is the source of the execution intent.
+   */
+  useEffect(() => {
+    setPreference(validPreference);
+  }, [validPreference]);
+
+  /*
+   * Request route intelligence from the backend.
+   *
+   * IMPORTANT:
+   * No route information is created on the frontend.
+   *
+   * The frontend only sends the execution intent:
+   * source chain
+   * destination chain
+   * asset
+   * amount
+   * preference
+   *
+   * The backend is responsible for generating and evaluating
+   * candidate routes.
+   */
+  useEffect(() => {
+    if (
+      !source ||
+      !destination ||
+      !asset ||
+      !amount ||
+      !preference
+    ) {
+      setData(null);
+      setSelectedId(null);
+      setError(null);
+      return;
+    }
+
+    /*
+     * Capture the values after the null check.
+     *
+     * This is important because TypeScript does not preserve
+     * the narrowing of values inside the nested async function.
+     *
+     * These constants contain only values supplied by the URL.
+     * Nothing is hardcoded here.
+     */
+    const sourceChain = source;
+    const destinationChain = destination;
+    const assetName = asset;
+    const amountValue = amount;
+    const preferenceValue = preference;
+
+    const numericAmount = Number(amountValue);
+
+    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+      setData(null);
+      setSelectedId(null);
+      setError("Invalid execution amount.");
+      return;
+    }
+
+    let cancelled = false;
+
+    async function loadRoutes() {
+      try {
+        setLoading(true);
+        setError(null);
+
+        /*
+         * Backend integration point.
+         *
+         * No route data is hardcoded here.
+         * The backend must return the complete
+         * RouteEvaluationResponse.
+         */
+        const result = await evaluateRoutes({
+          source_chain: sourceChain,
+          destination_chain: destinationChain,
+          asset: assetName,
+          amount: numericAmount,
+          preference: preferenceValue,
+        });
+
+        if (cancelled) {
+          return;
+        }
+
+        setData(result);
+
+        /*
+         * Prefer the backend's explicit recommendation.
+         *
+         * If the backend does not provide one, select nothing
+         * instead of inventing a recommendation.
+         */
+        setSelectedId(result.recommended_route_id ?? null);
+      } catch (err) {
+        if (cancelled) {
+          return;
+        }
+
+        setData(null);
+        setSelectedId(null);
+
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Unable to load route intelligence."
+        );
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+
+    loadRoutes();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    source,
+    destination,
+    asset,
+    amount,
+    preference,
+  ]);
+
+  /*
+   * Every route shown on this page comes from the backend.
+   */
+  const routes = data?.routes ?? [];
 
   const selected =
-    routes.find((r) => r.id === selectedId) ?? recommendation;
+    routes.find((route) => route.id === selectedId) ?? null;
 
-  const amount = params.get("amount") || "500";
-  const asset = params.get("asset") || "USDC";
-  const source = params.get("source") || "ethereum";
-  const destination = params.get("destination") || "base";
+  /*
+   * Build the graph entirely from backend route paths.
+   *
+   * Nothing about Ethereum, Base, Arbitrum, Optimism, etc.
+   * is assumed here.
+   */
+  const graphNodes = useMemo(() => {
+    const nodes: string[] = [];
+
+    for (const route of routes) {
+      for (const chain of route.path) {
+        if (!nodes.includes(chain)) {
+          nodes.push(chain);
+        }
+      }
+    }
+
+    return nodes;
+  }, [routes]);
+
+  /*
+   * Convert backend paths into graph edges.
+   *
+   * Multiple routes may use the same chain-to-chain connection,
+   * so we deduplicate them.
+   */
+  const graphEdges = useMemo(() => {
+    const edgeMap = new Map<
+      string,
+      {
+        from: string;
+        to: string;
+        routeIds: string[];
+      }
+    >();
+
+    for (const route of routes) {
+      for (let i = 0; i < route.path.length - 1; i++) {
+        const from = route.path[i];
+        const to = route.path[i + 1];
+        const key = `${from}::${to}`;
+
+        const existing = edgeMap.get(key);
+
+        if (existing) {
+          if (!existing.routeIds.includes(route.id)) {
+            existing.routeIds.push(route.id);
+          }
+        } else {
+          edgeMap.set(key, {
+            from,
+            to,
+            routeIds: [route.id],
+          });
+        }
+      }
+    }
+
+    return Array.from(edgeMap.values());
+  }, [routes]);
+
+  /*
+   * Derived entirely from backend route data.
+   */
+  const paretoCount = routes.filter(
+    (route) => route.pareto_optimal
+  ).length;
+
+  const handlePolicyChange = (nextPreference: Preference) => {
+    setPreference(nextPreference);
+
+    const nextParams = new URLSearchParams(
+      params.toString()
+    );
+
+    nextParams.set("preference", nextPreference);
+
+    router.replace(
+      `/intelligence?${nextParams.toString()}`,
+      { scroll: false }
+    );
+  };
+
+  const continueToExecution = () => {
+    if (!selected || !data) {
+      return;
+    }
+
+    const nextParams = new URLSearchParams();
+
+    /*
+     * Route ID comes directly from backend response.
+     */
+    nextParams.set("route", selected.id);
+
+    /*
+     * Request ID comes directly from backend response.
+     */
+    nextParams.set("request_id", data.request_id);
+
+    /*
+     * Preserve the original execution intent.
+     */
+    if (source) {
+      nextParams.set("source", source);
+    }
+
+    if (destination) {
+      nextParams.set("destination", destination);
+    }
+
+    if (asset) {
+      nextParams.set("asset", asset);
+    }
+
+    if (amount) {
+      nextParams.set("amount", amount);
+    }
+
+    if (preference) {
+      nextParams.set("preference", preference);
+    }
+
+    router.push(`/execute?${nextParams.toString()}`);
+  };
+
+  /*
+   * Missing intent state.
+   */
+  if (
+    !source ||
+    !destination ||
+    !asset ||
+    !amount ||
+    !preference
+  ) {
+    return (
+      <div className="intelligence-page">
+        <header className="intel-topbar">
+          <button
+            className="intel-back"
+            onClick={() => router.push("/")}
+          >
+            <ArrowLeft size={15} />
+            Command Center
+          </button>
+
+          <div className="intel-breadcrumb">
+            <span>RouteX</span>
+            <ChevronRight size={12} />
+            <strong>Route Intelligence</strong>
+          </div>
+
+          <div className="intel-live">
+            <span className="routex-dot" />
+            Waiting for execution intent
+          </div>
+        </header>
+
+        <main className="intel-content">
+          <div className="intel-hero">
+            <div>
+              <div className="routex-eyebrow">
+                Route discovery / decision engine
+              </div>
+
+              <h1 className="intel-title">
+                Route <span>intelligence.</span>
+              </h1>
+
+              <p className="intel-copy">
+                Submit a complete execution intent to discover and
+                evaluate available routes.
+              </p>
+            </div>
+          </div>
+
+          <section className="intel-card intel-detail">
+            <div className="intel-label">
+              Execution intent
+            </div>
+
+            <h2>
+              No execution request available
+            </h2>
+
+            <p className="simple-copy">
+              Source chain, destination chain, asset, amount and
+              preference are required before route evaluation can
+              begin.
+            </p>
+
+            <button
+              className="intel-execute"
+              onClick={() => router.push("/")}
+            >
+              Return to Command Center
+              <ArrowRight size={14} />
+            </button>
+          </section>
+        </main>
+      </div>
+    );
+  }
 
   return (
     <div className="intelligence-page">
@@ -182,7 +498,12 @@ function IntelligenceContent() {
 
         <div className="intel-live">
           <span className="routex-dot" />
-          Decision engine ready
+
+          {loading
+            ? "Evaluating routes"
+            : error
+              ? "Engine unavailable"
+              : "Decision engine ready"}
         </div>
       </header>
 
@@ -198,325 +519,544 @@ function IntelligenceContent() {
             </h1>
 
             <p className="intel-copy">
-              Evaluate viable execution paths for {amount} {asset} from{" "}
-              {source} to {destination} across cost, latency, liquidity,
-              slippage, reliability and security assumptions.
+              Evaluate viable execution paths for{" "}
+              <strong>
+                {amount} {asset}
+              </strong>{" "}
+              from{" "}
+              <strong>{source}</strong> to{" "}
+              <strong>{destination}</strong>{" "}
+              across cost, latency, liquidity, slippage,
+              reliability and security assumptions.
             </p>
           </div>
 
-          <div className="intel-route-pill">
-            <Network size={14} />
-            {routes.length} candidates ·{" "}
-            {routes.filter((r) => r.pareto).length} Pareto-optimal
-          </div>
+          {!loading && !error && data && (
+            <div className="intel-route-pill">
+              <Network size={14} />
+              {routes.length} candidates · {paretoCount}{" "}
+              Pareto-optimal
+            </div>
+          )}
         </div>
 
-        <div className="intel-workspace">
-          <section className="intel-card intel-graph-card">
-            <div className="intel-card-head">
-              <div>
-                <div className="intel-label">
-                  Dynamic route graph
-                </div>
-
-                <h2>
-                  Ethereum <span>→</span> Base
-                </h2>
-              </div>
-
-              <GitBranch size={18} />
-            </div>
-
-            <div className="intel-graph">
-              <div className="intel-node source">
-                <strong>Ethereum</strong>
-                <small>SOURCE</small>
-              </div>
-
-              <div className="intel-edge edge-a">
-                <span>RX-02 · $3.76 · 68s</span>
-              </div>
-
-              <div className="intel-node middle">
-                <strong>Arbitrum</strong>
-                <small>OPTIONAL HOP</small>
-              </div>
-
-              <div className="intel-edge edge-b">
-                <span>RX-01 · $4.21 · 124s</span>
-              </div>
-
-              <div className="intel-edge edge-c">
-                <span>
-                  RX-03 · via Arbitrum · $2.94
-                </span>
-              </div>
-
-              <div className="intel-node destination">
-                <strong>Base</strong>
-                <small>DESTINATION</small>
-              </div>
-            </div>
-
-            <div className="intel-graph-note">
-              <Info size={13} />
-              Nodes represent chains. Edges represent bridge, solver or
-              settlement mechanisms.
-            </div>
-          </section>
-
-          <section className="intel-card intel-recommendation">
-            <div className="intel-card-head">
-              <div>
-                <div className="intel-label">
-                  Policy layer
-                </div>
-
-                <h2>Recommendation</h2>
-              </div>
-
-              <Sparkles size={18} />
-            </div>
-
-            <div className="intel-rec-main">
-              <div className="intel-rec-title">
-                <strong>{recommendation.id}</strong>
-
-                <span>
-                  <Check size={12} />
-                  RECOMMENDED
-                </span>
-              </div>
-
-              <div className="intel-rec-path">
-                {recommendation.path.join(" → ")} ·{" "}
-                {recommendation.provider}
-              </div>
-            </div>
-
-            <div className="intel-metrics">
-              <div>
-                <small>COST</small>
-                <strong>
-                  {money(recommendation.cost)}
-                </strong>
-              </div>
-
-              <div>
-                <small>LATENCY</small>
-                <strong>
-                  {duration(recommendation.latency)}
-                </strong>
-              </div>
-
-              <div>
-                <small>RELIABILITY</small>
-                <strong>
-                  {recommendation.reliability}%
-                </strong>
-              </div>
-            </div>
-
-            <div className="intel-why">
-              <small>WHY THIS ROUTE</small>
-
-              <p>
-                {policy === "Balanced"
-                  ? "Balances execution cost, speed, reliability and path complexity instead of optimizing a single metric."
-                  : `Selected under the ${policy.toLowerCase()} policy while remaining within the discovered candidate set.`}
-              </p>
-            </div>
-
-            <div className="intel-policy-caption">
-              Policy: <strong>{policy}</strong> · choose another policy below.
-            </div>
-          </section>
-        </div>
-
-        <section className="intel-card intel-table-card">
-          <div className="intel-table-head">
-            <div>
-              <div className="intel-label">
-                Normalized evaluation
-              </div>
-
-              <h2>Compare candidate routes</h2>
-            </div>
-
-            <div className="intel-policies">
-              {policies.map((p) => (
-                <button
-                  key={p}
-                  className={policy === p ? "active" : ""}
-                  onClick={() => {
-                    setPolicy(p);
-                    setSelectedId(choose(routes, p).id);
-                  }}
-                >
-                  {p}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="intel-table-wrap">
-            <div className="intel-row intel-header">
-              <span>ROUTE</span>
-              <span>COST</span>
-              <span>TIME</span>
-              <span>LIQUIDITY</span>
-              <span>SLIPPAGE</span>
-              <span>RELIABILITY</span>
-              <span>STATUS</span>
-            </div>
-
-            {routes.map((r) => (
-              <button
-                key={r.id}
-                className={`intel-row intel-data ${
-                  selected.id === r.id ? "selected" : ""
-                }`}
-                onClick={() => setSelectedId(r.id)}
-              >
-                <span>
-                  <strong>{r.id}</strong>
-                  <small>
-                    {r.path.join(" → ")} · {r.provider}
-                  </small>
-                </span>
-
-                <span>{money(r.cost)}</span>
-
-                <span>{duration(r.latency)}</span>
-
-                <span>{money(r.liquidity)}</span>
-
-                <span>{r.slippage.toFixed(2)}%</span>
-
-                <span>{r.reliability}%</span>
-
-                <span
-                  className={
-                    r.pareto ? "pareto" : "normal"
-                  }
-                >
-                  {r.pareto ? "PARETO" : "Candidate"}
-                </span>
-              </button>
-            ))}
-          </div>
-        </section>
-
-        <div className="intel-detail-grid">
+        {loading && (
           <section className="intel-card intel-detail">
             <div className="intel-label">
-              Selected route
+              Route evaluation
             </div>
 
             <h2>
-              {selected.id} · {selected.provider}
+              Evaluating execution paths...
             </h2>
 
-            <div className="intel-path-large">
-              {selected.path.map((node, i) => (
-                <span key={`${node}-${i}`}>
-                  <b>{node}</b>
-
-                  {i < selected.path.length - 1 && (
-                    <ArrowRight size={14} />
-                  )}
-                </span>
-              ))}
-            </div>
-
-            <div className="intel-detail-stats">
-              <div>
-                <DollarSign />
-
-                <small>Execution cost</small>
-
-                <strong>
-                  {money(selected.cost)}
-                </strong>
-              </div>
-
-              <div>
-                <Clock3 />
-
-                <small>Estimated latency</small>
-
-                <strong>
-                  {duration(selected.latency)}
-                </strong>
-              </div>
-
-              <div>
-                <TrendingDown />
-
-                <small>Expected slippage</small>
-
-                <strong>
-                  {selected.slippage.toFixed(2)}%
-                </strong>
-              </div>
-
-              <div>
-                <ShieldCheck />
-
-                <small>Security model</small>
-
-                <strong>
-                  {selected.security}
-                </strong>
-              </div>
-            </div>
+            <p className="simple-copy">
+              The execution intelligence backend is evaluating
+              available routes for this intent.
+            </p>
           </section>
+        )}
 
-          <section className="intel-card intel-explain">
+        {!loading && error && (
+          <section className="intel-card intel-detail">
             <div className="intel-label">
-              Explainability
+              Route evaluation
             </div>
 
             <h2>
-              Why the engine surfaced this path
+              Unable to load route intelligence
             </h2>
 
-            <ul>
-              <li>
-                <Check />
-                The route satisfies the requested source and destination.
-              </li>
-
-              <li>
-                <Check />
-                Cost, latency and reliability were normalized before
-                comparison.
-              </li>
-
-              <li>
-                <Check />
-                Pareto filtering removes dominated alternatives.
-              </li>
-
-              <li>
-                <Check />
-                The active policy determines the final recommendation.
-              </li>
-            </ul>
+            <p className="simple-copy">
+              {error}
+            </p>
 
             <button
               className="intel-execute"
-              onClick={() =>
-                router.push(
-                  `/execute?route=${selected.id}&amount=${amount}&asset=${asset}`
-                )
-              }
+              onClick={() => window.location.reload()}
             >
-              Continue to execution
+              Retry evaluation
               <ArrowRight size={14} />
             </button>
           </section>
-        </div>
+        )}
+
+        {!loading &&
+          !error &&
+          data &&
+          routes.length === 0 && (
+            <section className="intel-card intel-detail">
+              <div className="intel-label">
+                Route evaluation
+              </div>
+
+              <h2>
+                No candidate routes returned
+              </h2>
+
+              <p className="simple-copy">
+                The backend did not return an executable route for
+                this execution intent.
+              </p>
+            </section>
+          )}
+
+        {!loading &&
+          !error &&
+          data &&
+          routes.length > 0 && (
+            <>
+              <div className="intel-workspace">
+                <section className="intel-card intel-graph-card">
+                  <div className="intel-card-head">
+                    <div>
+                      <div className="intel-label">
+                        Dynamic route graph
+                      </div>
+
+                      <h2>
+                        {data.source_chain}
+                        <span> → </span>
+                        {data.destination_chain}
+                      </h2>
+                    </div>
+
+                    <GitBranch size={18} />
+                  </div>
+
+                  <div
+                    className="intel-graph"
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "16px",
+                      padding: "24px",
+                    }}
+                  >
+                    {graphEdges.length > 0 ? (
+                      graphEdges.map((edge) => (
+                        <div
+                          key={`${edge.from}-${edge.to}`}
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "12px",
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <div className="intel-node">
+                            <strong>{edge.from}</strong>
+                            <small>CHAIN</small>
+                          </div>
+
+                          <div
+                            style={{
+                              flex: "1 1 80px",
+                              minWidth: "80px",
+                              height: "1px",
+                              background:
+                                "rgba(143, 134, 238, 0.45)",
+                            }}
+                          />
+
+                          <div
+                            className="intel-edge"
+                            style={{
+                              position: "static",
+                              transform: "none",
+                            }}
+                          >
+                            <span>
+                              {edge.routeIds.join(" · ")}
+                            </span>
+                          </div>
+
+                          <div
+                            style={{
+                              flex: "1 1 80px",
+                              minWidth: "80px",
+                              height: "1px",
+                              background:
+                                "rgba(143, 134, 238, 0.45)",
+                            }}
+                          />
+
+                          <div className="intel-node">
+                            <strong>{edge.to}</strong>
+                            <small>CHAIN</small>
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="simple-copy">
+                        No graph connections were returned by
+                        the backend.
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="intel-graph-note">
+                    <Info size={13} />
+                    Nodes represent chains. Edges represent
+                    bridge, solver or settlement mechanisms
+                    returned by the execution intelligence
+                    backend.
+                  </div>
+                </section>
+
+                <section className="intel-card intel-recommendation">
+                  <div className="intel-card-head">
+                    <div>
+                      <div className="intel-label">
+                        Policy layer
+                      </div>
+
+                      <h2>Recommendation</h2>
+                    </div>
+
+                    <Sparkles size={18} />
+                  </div>
+
+                  {data.recommended_route_id &&
+                  routes.find(
+                    (route) =>
+                      route.id === data.recommended_route_id
+                  ) ? (
+                    (() => {
+                      const recommendation =
+                        routes.find(
+                          (route) =>
+                            route.id ===
+                            data.recommended_route_id
+                        )!;
+
+                      return (
+                        <>
+                          <div className="intel-rec-main">
+                            <div className="intel-rec-title">
+                              <strong>
+                                {recommendation.id}
+                              </strong>
+
+                              <span>
+                                <Check size={12} />
+                                RECOMMENDED
+                              </span>
+                            </div>
+
+                            <div className="intel-rec-path">
+                              {recommendation.path.join(
+                                " → "
+                              )}{" "}
+                              · {recommendation.provider}
+                            </div>
+                          </div>
+
+                          <div className="intel-metrics">
+                            <div>
+                              <small>COST</small>
+
+                              <strong>
+                                {money(
+                                  recommendation.cost
+                                )}
+                              </strong>
+                            </div>
+
+                            <div>
+                              <small>LATENCY</small>
+
+                              <strong>
+                                {duration(
+                                  recommendation.latency_seconds
+                                )}
+                              </strong>
+                            </div>
+
+                            <div>
+                              <small>RELIABILITY</small>
+
+                              <strong>
+                                {recommendation.reliability}%
+                              </strong>
+                            </div>
+                          </div>
+
+                          <div className="intel-why">
+                            <small>
+                              WHY THIS ROUTE
+                            </small>
+
+                            <p>
+                              {data.explanation ||
+                                "No explanation was provided by the backend."}
+                            </p>
+                          </div>
+
+                          <div className="intel-policy-caption">
+                            Policy:{" "}
+                            <strong>
+                              {formatPreference(
+                                data.preference
+                              )}
+                            </strong>
+                          </div>
+                        </>
+                      );
+                    })()
+                  ) : (
+                    <div className="simple-copy">
+                      The backend did not provide a recommended
+                      route.
+                    </div>
+                  )}
+                </section>
+              </div>
+
+              <section className="intel-card intel-table-card">
+                <div className="intel-table-head">
+                  <div>
+                    <div className="intel-label">
+                      Normalized evaluation
+                    </div>
+
+                    <h2>
+                      Compare candidate routes
+                    </h2>
+                  </div>
+
+                  <div className="intel-policies">
+                    {policies.map((policy) => (
+                      <button
+                        key={policy.value}
+                        className={
+                          preference === policy.value
+                            ? "active"
+                            : ""
+                        }
+                        onClick={() =>
+                          handlePolicyChange(
+                            policy.value
+                          )
+                        }
+                      >
+                        {policy.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="intel-table-wrap">
+                  <div className="intel-row intel-header">
+                    <span>ROUTE</span>
+                    <span>COST</span>
+                    <span>TIME</span>
+                    <span>LIQUIDITY</span>
+                    <span>SLIPPAGE</span>
+                    <span>RELIABILITY</span>
+                    <span>STATUS</span>
+                  </div>
+
+                  {routes.map((route) => (
+                    <button
+                      key={route.id}
+                      className={`intel-row intel-data ${
+                        selected?.id === route.id
+                          ? "selected"
+                          : ""
+                      }`}
+                      onClick={() =>
+                        setSelectedId(route.id)
+                      }
+                    >
+                      <span>
+                        <strong>{route.id}</strong>
+
+                        <small>
+                          {route.path.join(" → ")} ·{" "}
+                          {route.provider}
+                        </small>
+                      </span>
+
+                      <span>
+                        {money(route.cost)}
+                      </span>
+
+                      <span>
+                        {duration(
+                          route.latency_seconds
+                        )}
+                      </span>
+
+                      <span>
+                        {money(route.liquidity)}
+                      </span>
+
+                      <span>
+                        {route.slippage.toFixed(2)}%
+                      </span>
+
+                      <span>
+                        {route.reliability}%
+                      </span>
+
+                      <span
+                        className={
+                          route.pareto_optimal
+                            ? "pareto"
+                            : "normal"
+                        }
+                      >
+                        {route.pareto_optimal
+                          ? "PARETO"
+                          : route.status || "Candidate"}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </section>
+
+              {selected && (
+                <div className="intel-detail-grid">
+                  <section className="intel-card intel-detail">
+                    <div className="intel-label">
+                      Selected route
+                    </div>
+
+                    <h2>
+                      {selected.id} ·{" "}
+                      {selected.provider}
+                    </h2>
+
+                    <div className="intel-path-large">
+                      {selected.path.map(
+                        (node, index) => (
+                          <span
+                            key={`${node}-${index}`}
+                          >
+                            <b>{node}</b>
+
+                            {index <
+                              selected.path.length -
+                                1 && (
+                              <ArrowRight
+                                size={14}
+                              />
+                            )}
+                          </span>
+                        )
+                      )}
+                    </div>
+
+                    <div className="intel-detail-stats">
+                      <div>
+                        <DollarSign />
+
+                        <small>
+                          Execution cost
+                        </small>
+
+                        <strong>
+                          {money(selected.cost)}
+                        </strong>
+                      </div>
+
+                      <div>
+                        <Clock3 />
+
+                        <small>
+                          Estimated latency
+                        </small>
+
+                        <strong>
+                          {duration(
+                            selected.latency_seconds
+                          )}
+                        </strong>
+                      </div>
+
+                      <div>
+                        <TrendingDown />
+
+                        <small>
+                          Expected slippage
+                        </small>
+
+                        <strong>
+                          {selected.slippage.toFixed(
+                            2
+                          )}
+                          %
+                        </strong>
+                      </div>
+
+                      <div>
+                        <ShieldCheck />
+
+                        <small>
+                          Security model
+                        </small>
+
+                        <strong>
+                          {getSecurityText(
+                            selected
+                          )}
+                        </strong>
+                      </div>
+                    </div>
+                  </section>
+
+                  <section className="intel-card intel-explain">
+                    <div className="intel-label">
+                      Explainability
+                    </div>
+
+                    <h2>
+                      Route evaluation details
+                    </h2>
+
+                    {data.explanation ? (
+                      <p className="simple-copy">
+                        {data.explanation}
+                      </p>
+                    ) : (
+                      <p className="simple-copy">
+                        The backend did not provide an
+                        explanation for this route.
+                      </p>
+                    )}
+
+                    {selected.security_assumptions &&
+                      selected.security_assumptions
+                        .length > 0 && (
+                        <ul>
+                          {selected.security_assumptions.map(
+                            (assumption, index) => (
+                              <li
+                                key={`${assumption}-${index}`}
+                              >
+                                <Check />
+                                {assumption}
+                              </li>
+                            )
+                          )}
+                        </ul>
+                      )}
+
+                    <button
+                      className="intel-execute"
+                      onClick={
+                        continueToExecution
+                      }
+                    >
+                      Continue to execution
+                      <ArrowRight size={14} />
+                    </button>
+                  </section>
+                </div>
+              )}
+            </>
+          )}
       </main>
     </div>
   );
@@ -532,7 +1072,8 @@ export default function IntelligencePage() {
           </div>
 
           <h1>
-            Loading <span>route intelligence.</span>
+            Loading{" "}
+            <span>route intelligence.</span>
           </h1>
 
           <p className="simple-copy">

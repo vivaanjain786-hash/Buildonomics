@@ -24,7 +24,6 @@ export interface Route {
   reliability: number;
 
   hops: number;
-
   pareto_optimal: boolean;
   recommended: boolean;
 
@@ -44,13 +43,17 @@ export interface RouteEvaluationResponse {
   routes: Route[];
 
   recommended_route_id?: string;
-
   explanation?: string;
 }
 
 export interface NetworkHealth {
   chain: string;
-  status: "operational" | "degraded" | "offline" | "unknown";
+  status:
+    | "operational"
+    | "degraded"
+    | "offline"
+    | "unknown";
+
   latency_ms?: number;
   congestion?: number;
 }
@@ -70,18 +73,20 @@ export interface PortfolioResponse {
 
 export interface Transaction {
   id: string;
+
   route_id?: string;
 
   source_chain: string;
   destination_chain: string;
-
   asset: string;
   amount: number;
 
-  status: "pending" | "completed" | "failed";
+  status:
+    | "pending"
+    | "completed"
+    | "failed";
 
   cost?: number;
   latency_seconds?: number;
-
   created_at: string;
 }
