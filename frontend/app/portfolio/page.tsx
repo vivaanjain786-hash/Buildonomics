@@ -1,0 +1,3 @@
+﻿import { ArrowLeft, BarChart3, Wallet } from "lucide-react";
+import Link from "next/link";
+export default function PortfolioPage() { return <main className="simple-product-page"><Link className="simple-back" href="/"><ArrowLeft size={14}/> Command Center</Link><div className="routex-eyebrow">Portfolio intelligence</div><h1>Portfolio <span>across chains.</span></h1><p className="simple-copy">A normalized view of tracked execution value and chain distribution.</p><section className="simple-kpi-grid"><div className="simple-kpi"><Wallet/><small>Tracked value</small><strong>$12,482.00</strong></div><div className="simple-kpi"><BarChart3/><small>Chains</small><strong>4 active</strong></div></section></main>; }
